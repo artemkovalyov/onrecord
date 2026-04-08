@@ -1,0 +1,17 @@
+[package]
+name = "annotations"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "annotations"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = { version = "0.11", features = ["v4_12"] }
+gdk4 = "0.11"
+cairo-rs = { version = "0.22", features = ["use_glib"] }
+glib = "0.22"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
