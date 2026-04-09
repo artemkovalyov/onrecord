@@ -4,12 +4,12 @@ use gdk4::ModifierType;
 use glib::clone;
 use std::sync::{Arc, Mutex};
 use crate::state::{AppState, PathTool, Stroke, StrokeWidth, Tool};
-use crate::overlay::set_input_passthrough;
 
 pub fn attach_drawing_events(
     overlay: &ApplicationWindow,
     drawing_area: &DrawingArea,
     state: Arc<Mutex<AppState>>,
+    on_draw_mode_change: impl Fn(bool) + 'static,
 ) {
     // -- Drag gesture (freehand, line, rect, ellipse, laser, eraser) --
     let drag = GestureDrag::new();
@@ -146,7 +146,6 @@ pub fn attach_drawing_events(
     // -- Keyboard (shortcuts + text input) --
     let key_ctrl = EventControllerKey::new();
     let state_key = state.clone();
-    let overlay_key = overlay.clone();
     let da_key = drawing_area.clone();
     key_ctrl.connect_key_pressed(move |_, key, _, modifiers| {
         let ctrl = modifiers.contains(ModifierType::CONTROL_MASK);
@@ -211,7 +210,8 @@ pub fn attach_drawing_events(
                 st.draw_mode = !st.draw_mode;
                 let dm = st.draw_mode;
                 drop(st);
-                set_input_passthrough(&overlay_key, !dm);
+                // on_draw_mode_change handles both CSS class and input passthrough
+                on_draw_mode_change(dm);
                 da_key.queue_draw();
                 glib::Propagation::Stop
             }

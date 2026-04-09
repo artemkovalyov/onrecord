@@ -4,7 +4,7 @@
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, ColorButton,
-    EventControllerKey, Orientation, Separator,
+    EventControllerKey, GestureClick, Label, Orientation, Separator,
 };
 use gdk4::{Key, ModifierType, RGBA};
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,7 @@ pub fn build_toolbar(
     state: Arc<Mutex<AppState>>,
     overlay_win: ApplicationWindow,
     on_redraw: impl Fn() + 'static + Clone,
+    initial_position: [i32; 2],
 ) -> ApplicationWindow {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -34,36 +35,79 @@ pub fn build_toolbar(
         .resizable(false)
         .build();
 
-    window.set_default_size(440, 48);
+    window.set_default_size(480, 48);
 
     let hbox = GtkBox::new(Orientation::Horizontal, 2);
-    hbox.set_margin_start(6);
+    hbox.set_margin_start(4);
     hbox.set_margin_end(6);
     hbox.set_margin_top(4);
     hbox.set_margin_bottom(4);
 
+    // -- Drag handle --
+    let drag_handle = Label::new(Some("⠿"));
+    drag_handle.set_tooltip_text(Some("Drag to move toolbar"));
+    drag_handle.set_margin_start(2);
+    drag_handle.set_margin_end(4);
+    drag_handle.add_css_class("drag-handle");
+    let drag_gesture = GestureClick::new();
+    drag_gesture.set_button(gdk4::BUTTON_PRIMARY);
+    {
+        let win_drag = window.clone();
+        drag_gesture.connect_pressed(move |gesture, _n, x, y| {
+            use gdk4::prelude::ToplevelExt;
+            let Some(surface) = win_drag.surface() else { return };
+            let Ok(toplevel) = surface.downcast::<gdk4::Toplevel>() else { return };
+            let Some(device) = gesture.device() else { return };
+            let ts = gesture.current_event_time();
+            toplevel.begin_move(&device, gdk4::BUTTON_PRIMARY as i32, x, y, ts);
+        });
+    }
+    drag_handle.add_controller(drag_gesture);
+    hbox.append(&drag_handle);
+
+    hbox.append(&separator());
+
     // -- Tool buttons --
+    // Store (button, tool) pairs so we can update .active CSS class on selection
     let tools: &[(&str, &str, Tool)] = &[
         ("\u{270F}", "Pen",         Tool::Pen),
         ("\u{301C}", "Highlighter", Tool::Highlighter),
         ("\u{2571}", "Line",        Tool::Line),
         ("\u{25AD}", "Rectangle",   Tool::Rectangle),
         ("\u{25CB}", "Ellipse",     Tool::Ellipse),
-        ("T", "Text",        Tool::Text),
+        ("T",        "Text",        Tool::Text),
         ("\u{2B24}", "Laser",       Tool::Laser),
         ("\u{232B}", "Eraser",      Tool::Eraser),
     ];
 
-    for (icon, tooltip, tool) in tools {
+    // Collect buttons so we can update their active state
+    let tool_buttons: Vec<(Button, Tool)> = tools.iter().map(|(icon, tooltip, tool)| {
         let btn = tool_button(icon, tooltip);
+        (*tool == Tool::Pen).then(|| btn.add_css_class("active")); // Pen is default
+        (btn, *tool)
+    }).collect();
+
+    // Wrap in Arc so each click handler can update all buttons
+    let tool_buttons = Arc::new(tool_buttons);
+
+    for (btn, t) in tool_buttons.iter() {
         let state_c = state.clone();
-        let t = *tool;
         let redraw = on_redraw.clone();
+        let tool = *t;
+        let btns = tool_buttons.clone();
         btn.connect_clicked(move |_| {
-            state_c.lock().unwrap().active_tool = t;
+            state_c.lock().unwrap().active_tool = tool;
+            // Update .active class on all tool buttons
+            for (b, bt) in btns.iter() {
+                if *bt == tool {
+                    b.add_css_class("active");
+                } else {
+                    b.remove_css_class("active");
+                }
+            }
             redraw();
         });
-        hbox.append(&btn);
+        hbox.append(btn);
     }
 
     hbox.append(&separator());
@@ -124,7 +168,14 @@ pub fn build_toolbar(
         st.draw_mode = !st.draw_mode;
         let dm = st.draw_mode;
         drop(st);
-        crate::overlay::set_input_passthrough(&overlay_c, !dm);
+        let toolbar_rect = if dm {
+            crate::platform::get_window_position(&window_ref).map(|[x, y]| {
+                (x, y, window_ref.width(), window_ref.height())
+            })
+        } else {
+            None
+        };
+        crate::overlay::set_input_passthrough(&overlay_c, !dm, toolbar_rect);
         if dm {
             window_ref.add_css_class("draw-active");
         } else {
@@ -155,9 +206,44 @@ pub fn build_toolbar(
     });
     hbox.append(&clear_btn);
 
+    hbox.append(&separator());
+
+    // -- Close button --
+    let close_btn = tool_button("\u{23FB}", "Quit (close app)");
+    close_btn.add_css_class("close-btn");
+    {
+        let app_ref = app.clone();
+        close_btn.connect_clicked(move |_| {
+            app_ref.quit();
+        });
+    }
+    hbox.append(&close_btn);
+
     window.set_child(Some(&hbox));
     window.set_widget_name("annotations-toolbar");
-    // Note: set_keep_above() was removed in GTK4. Always-on-top requires WM hints (post-MVP).
+    // Set ABOVE+STICKY before map
+    window.connect_realize(move |win| {
+        crate::platform::setup_toolbar_pre_map(win);
+    });
+    // Reposition and reinforce ABOVE state after map — once only
+    {
+        let pos = initial_position;
+        let positioned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        window.connect_map(move |win| {
+            if positioned.compare_exchange(
+                false, true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ).is_ok() {
+                crate::platform::setup_toolbar_post_map(win, pos);
+            }
+            // Reinforce ABOVE every time the toolbar is shown (handles re-show after hide)
+            let win2 = win.clone();
+            glib::idle_add_local_once(move || {
+                crate::platform::setup_toolbar_above_post_map(&win2);
+            });
+        });
+    }
 
     // Apply CSS scoped to toolbar window only (avoids affecting overlay transparency)
     let css = gtk4::CssProvider::new();
@@ -165,7 +251,9 @@ pub fn build_toolbar(
         "#annotations-toolbar { background-color: rgba(30,30,30,0.92); border-radius: 12px; }
          #annotations-toolbar button { background: none; border: none; color: #eee; font-size: 16px; border-radius: 6px; }
          #annotations-toolbar button:hover { background-color: rgba(255,255,255,0.12); }
-         #annotations-toolbar.draw-active { border: 2px solid #e53935; }",
+         #annotations-toolbar button.active { background-color: rgba(255,255,255,0.22); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.4); }
+         #annotations-toolbar.draw-active { border: 2px solid #e53935; }
+         #annotations-toolbar .drag-handle { color: #888; font-size: 18px; cursor: move; padding: 0 4px; }",
     );
     gtk4::style_context_add_provider_for_display(
         &gdk4::Display::default().unwrap(),
